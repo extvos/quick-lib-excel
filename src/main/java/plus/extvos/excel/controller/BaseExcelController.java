@@ -10,9 +10,13 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.ModelAndView;
 import plus.extvos.common.Result;
+import plus.extvos.common.ResultCode;
+import plus.extvos.common.Validator;
 import plus.extvos.common.exception.ResultException;
 import plus.extvos.common.utils.SpringContextHolder;
 import plus.extvos.excel.dto.CellMapper;
+import plus.extvos.excel.dto.MappedResponse;
+import plus.extvos.excel.utils.BaseExcelReadListener;
 import plus.extvos.logging.annotation.Log;
 import plus.extvos.logging.annotation.type.LogAction;
 import plus.extvos.logging.annotation.type.LogLevel;
@@ -105,7 +109,7 @@ public abstract class BaseExcelController<T, S extends BaseService<T>> extends B
     @PostMapping("/_excel")
     @Log(action = LogAction.CREATE, level = LogLevel.IMPORTANT, comment = "Import from Excel to CREATE")
     @Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRES_NEW)
-    public Result<T> importFromExcel(
+    public Result<MappedResponse<T>> importFromExcel(
             @ApiParam(hidden = true) @PathVariable(required = false) Map<String, Object> pathMap,
             @RequestBody MultipartFile file) throws ResultException {
         log.debug("importFromExcel:> {}, {}", pathMap, file.getOriginalFilename());
@@ -113,12 +117,70 @@ public abstract class BaseExcelController<T, S extends BaseService<T>> extends B
 //        Result<T> ret = Result.data(record).success(ResultCode.CREATED);
 //        ret.setCount((long) n);
 //        return ret;
-        throw ResultException.notImplemented();
+        BaseExcelReadListener<T> listener = new BaseExcelReadListener<T>(defaultCellMappers());
+        try {
+            EasyExcel.read(file.getInputStream())
+                    .sheet()
+                    .head(buildHead(defaultCellMappers()))
+//                    .registerConverter(new BaseExcelConverter<T>(getGenericType(), defaultCellMappers()))
+                    .registerReadListener(listener).doRead();
+            MappedResponse<T> resp = new MappedResponse<T>(cellMappers, listener.getList());
+            return Result.data(resp).success();
+        } catch (IOException e) {
+            throw ResultException.internalServerError(e.getMessage());
+        }
+    }
+
+    @ApiOperation(value = "插入EXCEL读取记录", notes = "查询条件组织，请参考： https://github.com/extvos/quick-lib-restlet/blob/develop/README.md")
+    @PostMapping("/_excel/import")
+    @Log(action = LogAction.CREATE, level = LogLevel.IMPORTANT, comment = "Generic CREATE")
+    @Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRES_NEW)
+    public Result<?> importRecords(
+            @ApiParam(hidden = true) @PathVariable(required = false) Map<String, Object> pathMap,
+            @RequestBody T[] records) throws ResultException {
+        log.debug("importRecords:1> {}", pathMap);
+        if (null != records && records.length > 0) {
+            log.debug("importRecords:2> {}", records.length);
+            if (Validator.notEmpty(pathMap)) {
+                for (T rec : records) {
+                    for (String k : pathMap.keySet()) {
+                        updateFieldValue(rec, k, pathMap.get(k));
+                    }
+                }
+            }
+            records = preInsert(records);
+            int n = getService().insert(Arrays.asList(records));
+            postInsert(records);
+            return Result.data(records).setCount((long) n).success(ResultCode.CREATED);
+        } else {
+            throw ResultException.badRequest("invalid request data");
+        }
+    }
+
+    public T[] preInsert(T[] entities) throws ResultException {
+        if (!creatable()) {
+            throw ResultException.forbidden();
+        }
+        return entities;
+    }
+
+    public void postInsert(T[] entities) throws ResultException {
+
     }
 
     public List<List<String>> prepareRows(List<T> records) throws ResultException {
         List<List<String>> rows = records.stream().map(e -> buildRow(e, defaultCellMappers())).collect(Collectors.toList());
         return rows;
+    }
+
+    public List<List<String>> buildHead(@NotNull List<CellMapper> mappers) {
+        return mappers.stream().map(c -> {
+            if (c.getGroupName() != null) {
+                return Arrays.asList(c.getGroupName(), c.getCellName());
+            } else {
+                return Collections.singletonList(c.getCellName());
+            }
+        }).collect(Collectors.toList());
     }
 
     public void selectToExcel(
@@ -133,15 +195,10 @@ public abstract class BaseExcelController<T, S extends BaseService<T>> extends B
         response.setCharacterEncoding("utf-8");
         response.setHeader("Content-disposition", "attachment;" + depositionFilename);
         try {
-            EasyExcel.write(response.getOutputStream()).sheet(sheetName).head(
-                    mappers.stream().map(c -> {
-                        if (c.getGroupName() != null) {
-                            return Arrays.asList(c.getGroupName(), c.getCellName());
-                        } else {
-                            return Collections.singletonList(c.getCellName());
-                        }
-                    }).collect(Collectors.toList())
-            ).doWrite(prepareRows(records));
+            EasyExcel.write(response.getOutputStream())
+                    .sheet(sheetName)
+                    .head(buildHead(defaultCellMappers()))
+                    .doWrite(prepareRows(records));
         } catch (IOException e) {
             throw ResultException.internalServerError(e.getMessage());
         }
